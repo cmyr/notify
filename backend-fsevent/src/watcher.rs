@@ -30,6 +30,7 @@ struct EventStream<'a> {
     ids: &'a [u64],
 }
 
+#[derive(Debug)]
 struct FsEvent {
     path: PathBuf,
     flags: fse::StreamFlags,
@@ -188,6 +189,7 @@ fn callback_impl<'a>(ctx: &Context, stream: EventStream<'a>) {
     use MetadataKind as MetK;
 
     for event in stream {
+        eprintln!("fse_event {:?}", &event);
         let FsEvent { path, flags, id } = event;
         let kind = match flags {
             f if f.contains(fse::MUST_SCAN_SUBDIRS) =>
