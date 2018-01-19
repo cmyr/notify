@@ -1,7 +1,9 @@
 use libc;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{PathBuf, Path};
 use std::sync::{atomic, Arc, Barrier};
 use std::{slice, mem};
+use std::time::{Instant, Duration};
 use std::ffi::{CStr, OsString};
 use std::os::unix::ffi::OsStringExt;
 use std::ptr;
@@ -18,8 +20,14 @@ pub struct FsEventWatcher {
     runloop_ptr: Arc<atomic::AtomicPtr<libc::c_void>>,
 }
 
+struct HistoricalEvent {
+    timestamp: Instant,
+    flags: fse::StreamFlags,
+}
+
 struct Context {
     queue: WaitQueue,
+    history: HashMap<PathBuf, HistoricalEvent>,
 }
 
 struct EventStream<'a> {
@@ -30,6 +38,7 @@ struct EventStream<'a> {
     ids: &'a [u64],
 }
 
+#[derive(Debug)]
 struct FsEvent {
     path: PathBuf,
     flags: fse::StreamFlags,
@@ -54,41 +63,41 @@ impl FsEventWatcher {
         let latency = 0.0;
         let since_when = fs::kFSEventStreamEventIdSinceNow;
 
-            let ctx = Box::new(Context { queue });
-            let stream_ctx = fs::FSEventStreamContext {
-                version: 0,
-                info: unsafe { mem::transmute(Box::into_raw(ctx)) },
-                retain: cf::NULL,
-                copy_description: cf::NULL,
-            };
+        let ctx = Box::new(Context::new(queue));
+        let stream_ctx = fs::FSEventStreamContext {
+            version: 0,
+            info: unsafe { mem::transmute(Box::into_raw(ctx)) },
+            retain: cf::NULL,
+            copy_description: cf::NULL,
+        };
 
-            let cb = callback as *mut _;
-            unsafe {
-                let fse_stream = fs::FSEventStreamCreate(cf::kCFAllocatorDefault,
-                                                         cb,
-                                                         &stream_ctx,
-                                                         paths,
-                                                         since_when,
-                                                         latency,
-                                                         flags);
+        let cb = callback as *mut _;
+        unsafe {
+            let fse_stream = fs::FSEventStreamCreate(cf::kCFAllocatorDefault,
+                                                     cb,
+                                                     &stream_ctx,
+                                                     paths,
+                                                     since_when,
+                                                     latency,
+                                                     flags);
 
-                let runloop = cf::CFRunLoopGetCurrent();
+            let runloop = cf::CFRunLoopGetCurrent();
 
-                runloop_ptr2.store(runloop as *mut libc::c_void,
-                              atomic::Ordering::Relaxed);
+            runloop_ptr2.store(runloop as *mut libc::c_void,
+                               atomic::Ordering::Relaxed);
 
-                ptr_set_barrier2.wait();
+            ptr_set_barrier2.wait();
 
-                fs::FSEventStreamScheduleWithRunLoop(fse_stream, runloop,
-                                                     cf::kCFRunLoopDefaultMode);
-                fs::FSEventStreamStart(fse_stream);
+            fs::FSEventStreamScheduleWithRunLoop(fse_stream, runloop,
+                                                 cf::kCFRunLoopDefaultMode);
+            fs::FSEventStreamStart(fse_stream);
 
-                cf::CFRunLoopRun();
-                // the previous call blocks until we cancel from another thread
-                fs::FSEventStreamStop(fse_stream);
-                fs::FSEventStreamInvalidate(fse_stream);
-                fs::FSEventStreamRelease(fse_stream);
-            }
+            cf::CFRunLoopRun();
+            // the previous call blocks until we cancel from another thread
+            fs::FSEventStreamStop(fse_stream);
+            fs::FSEventStreamInvalidate(fse_stream);
+            fs::FSEventStreamRelease(fse_stream);
+        }
         });
 
         ptr_set_barrier.wait();
@@ -110,12 +119,51 @@ impl Drop for FsEventWatcher {
     }
 }
 
+impl HistoricalEvent {
+    /// Returnes `true` if this historical event is from the same 'FSEvent epoch'
+    /// as the new event.
+    fn is_same(&self, event: &FsEvent, timestamp: Instant) -> bool {
+        let elapsed = timestamp.duration_since(self.timestamp);
+        let is_superset = (self.flags - event.flags).is_empty();
+        is_superset && elapsed < Duration::from_secs(30)
+    }
+}
+
 impl Context {
+    fn new(queue: WaitQueue) -> Self {
+        Context {
+            queue: queue,
+            history: HashMap::new(),
+        }
+    }
+
     fn enqueue_event(&self, event: Event) {
         let &(ref deque, ref cond) = &*self.queue;
         let mut deque = deque.lock().unwrap();
         deque.push_back(event);
         cond.notify_one();
+    }
+
+    fn enqueue_raw<O: Into<Option<usize>>>(&self, kind: EventKind,
+                                           path: &Path,
+                                           relid: O) {
+        let paths = vec![path.to_owned()];
+        let relid = relid.into();
+        let event = Event { kind, paths, relid };
+        self.enqueue_event(event);
+    }
+
+    fn prev_event(&mut self, event: &FsEvent, timestamp: Instant)
+                  -> Option<HistoricalEvent> {
+        if let Some(prev) = self.history.remove(&event.path) {
+            if prev.is_same(event, timestamp) { None } else { Some(prev) }
+        } else {
+            None
+        }
+    }
+
+    fn add_event(&mut self, path: &Path, event: HistoricalEvent) {
+        self.history.insert(path.to_owned(), event);
     }
 }
 
@@ -169,7 +217,7 @@ pub unsafe extern "C" fn callback(stream_ref: fs::FSEventStreamRef,
     let num_events = num_events as usize;
     let event_flags = event_flags as *mut u32;
     let event_ids = event_ids as *mut u64;
-    let ctx = mem::transmute::<_, *const Context>(info);
+    let ctx = mem::transmute::<_, *mut Context>(info);
 
     let paths = slice::from_raw_parts(event_paths, num_events);
     let flags = slice::from_raw_parts_mut(event_flags, num_events);
@@ -177,75 +225,108 @@ pub unsafe extern "C" fn callback(stream_ref: fs::FSEventStreamRef,
 
     let cur_event = 0;
     let iter = EventStream { cur_event, num_events, paths, flags, ids };
-    callback_impl(&(*ctx), iter);
+    callback_impl(&mut (*ctx), iter);
 }
 
-fn callback_impl<'a>(ctx: &Context, stream: EventStream<'a>) {
+fn callback_impl<'a>(ctx: &mut Context, stream: EventStream<'a>) {
     use EventKind::*;
     use ModifyKind as MK;
     use RemoveKind as RK;
     use CreateKind as CK;
     use MetadataKind as MetK;
 
+
+    let mod_flags = (fse::ITEM_MODIFIED | fse::ITEM_XATTR_MOD
+                     | fse::ITEM_CHANGE_OWNER | fse::FINDER_INFO_MOD);
+
+    let trouble_flags = (fse::ITEM_CREATED | fse::ITEM_REMOVED
+                         | fse::ITEM_RENAMED);
+
+    let recv_time = Instant::now();
+
     for event in stream {
+        eprintln!("fse_event {:?}", &event);
+        let prev_event = ctx.prev_event(&event, recv_time);
         let FsEvent { path, flags, id } = event;
-        let kind = match flags {
-            f if f.contains(fse::MUST_SCAN_SUBDIRS) =>
-                Some(Other("rescan".into())),
 
-            f if f.contains(fse::ITEM_RENAMED) =>
-                Some(Modify(MK::Name(RenameMode::Any))),
+        if flags.contains(fse::MUST_SCAN_SUBDIRS) {
+            ctx.enqueue_raw(Other("rescan".into()), &path, None);
+            continue;
+        }
 
-            f if f.contains(fse::ITEM_REMOVED) => {
-                let typ = if f.contains(fse::IS_DIR) { RK::Folder } else { RK::File };
-                Some(Remove(typ))
+        let is_dir = flags.contains(fse::IS_DIR);
+
+        if let Some(prev_event) = prev_event {
+            // if create flag is present in old flags we ignore it in the new.
+            let temp_flags = flags - (prev_event.flags & fse::ITEM_CREATED);
+            if temp_flags.contains(fse::ITEM_CREATED) {
+                let cr_kind = if is_dir { CK::Folder } else { CK::File };
+                ctx.enqueue_raw(Create(cr_kind), &path, id);
             }
 
-            // create events may contain 'modify' flag, but modify events
-            // always contain 'inode meta mod'?
-            f if f.contains(fse::ITEM_CREATED) && !f.contains(fse::INOTE_META_MOD) => {
-                let typ = if f.contains(fse::IS_DIR) { CK::Folder } else { CK::File };
-                Some(Create(typ))
+            // if we contain any modification we just sent mod::any
+            // NOTE: if there is only one mod flag in temp_flags, and it's
+            // absent in the prev event, we could send a more specific event.
+            // It's annoying to figure that out, though, and unclear it's much
+            // of a win.
+            if !(temp_flags & mod_flags).is_empty() {
+                ctx.enqueue_raw(Modify(MK::Any), &path, id);
             }
+        }
 
-            // modify without create is always modify
-            f if f.contains(fse::ITEM_MODIFIED) && !f.contains(fse::ITEM_CREATED) =>
-                Some(Modify(MK::Data(DataChange::Any))),
+            //if flags.contains(fse::ITEM_RENAMED) {
+                //Some(Modify(MK::Name(RenameMode::Any))),
 
-                // modify with inode meta mod, with our w/o create, is modify
-            f if f.contains(fse::ITEM_MODIFIED) && f.contains(fse::INOTE_META_MOD) =>
-                Some(Modify(MK::Data(DataChange::Any))),
+            //if flags.contains(fse::ITEM_REMOVED) {
+                //let typ = if f.contains(fse::IS_DIR) { RK::Folder } else { RK::File };
+                //Some(Remove(typ))
+            //}
 
-            f if f.contains(fse::ITEM_CHANGE_OWNER) =>
-                Some(Modify(MK::Metadata(MetK::Ownership))),
+            //// create events may contain 'modify' flag, but modify events
+            //// always contain 'inode meta mod'?
+            //if flags.contains(fse::ITEM_CREATED) && !f.contains(fse::INOTE_META_MOD) {
+                //let typ = if f.contains(fse::IS_DIR) { CK::Folder } else { CK::File };
+                //Some(Create(typ))
+            //}
 
-            f if f.contains(fse::ITEM_XATTR_MOD) =>
-                Some(Modify(MK::Metadata(MetK::Other("attributes".into())))),
+            //// modify without create is always modify
+            //if flags.contains(fse::ITEM_MODIFIED) && !f.contains(fse::ITEM_CREATED) {
+                //Some(Modify(MK::Data(DataChange::Any)))
+            //}
 
-            f if f.contains(fse::FINDER_INFO_MOD) =>
-                Some(Modify(MK::Metadata(MetK::Other("finder_info".into())))),
+                //// modify with inode meta mod, with our w/o create, is modify
+            //if flags.contains(fse::ITEM_MODIFIED) && f.contains(fse::INOTE_META_MOD) {
+                //Some(Modify(MK::Data(DataChange::Any)))
+            //}
+
+            //if flags.contains(fse::ITEM_CHANGE_OWNER) {
+                //Some(Modify(MK::Metadata(MetK::Ownership)))
+            //}
+
+            //if flags.contains(fse::ITEM_XATTR_MOD) {
+                //Some(Modify(MK::Metadata(MetK::Other("attributes".into()))))
+            //}
+
+            //if flags.contains(fse::FINDER_INFO_MOD) {
+                //Some(Modify(MK::Metadata(MetK::Other("finder_info".into()))))
+            //}
 
             // NOTE: we don't currently handle the unmount case, because we do
             // not currently pass the WatchRoot flag to FSEventStream.
             // we _probably_ want to do this, although it's unclear how
             // we should handle moving directories along our path, e.g. when
             // watching foo/bar, moving foo -> foo2 (so our path is foo2/bar)
-            other => {
-                eprintln!("ignoring flags {:?} for path {:?}", flags, &path);
-                None
-            }
-        };
 
-        if let Some(kind) = kind {
+        //if let Some(kind) = kind {
 
-            let event = Event {
-                kind: kind,
-                paths: vec![path],
-                relid: None,
-            };
+            //let event = Event {
+                //kind: kind,
+                //paths: vec![path],
+                //relid: None,
+            //};
 
-            ctx.enqueue_event(event);
-        }
+            //ctx.enqueue_event(event);
+        //}
     }
 }
 
@@ -254,3 +335,41 @@ extern "C" {
     pub fn CFRunLoopIsWaiting(runloop: cf::CFRunLoopRef) -> bool;
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn prev_event() {
+        let p = PathBuf::from("/path/to/my/file.txt");
+        let flags: fse::StreamFlags = fse::ITEM_CREATED;
+        let timestamp = Instant::now() - Duration::from_secs(5);
+        let mut hist = HistoricalEvent { timestamp, flags };
+
+        let mut rel_event = FsEvent {
+            path: p.clone(),
+            flags: fse::ITEM_CREATED | fse::ITEM_MODIFIED,
+            id: 42,
+        };
+
+        assert!(hist.is_same(&rel_event, Instant::now()));
+
+        hist.flags = fse::INOTE_META_MOD | fse::ITEM_MODIFIED;
+        assert!(!hist.is_same(&rel_event, Instant::now()));
+
+        hist.flags = fse::ITEM_CREATED;
+        assert!(hist.is_same(&rel_event, Instant::now()));
+
+        hist.timestamp = Instant::now() - Duration::from_secs(31);
+        assert!(!hist.is_same(&rel_event, Instant::now()));
+
+        hist.timestamp = Instant::now() - Duration::from_secs(5);
+        assert!(hist.is_same(&rel_event, Instant::now()));
+
+        hist.flags = fse::ITEM_CREATED | fse::ITEM_MODIFIED;
+        assert!(hist.is_same(&rel_event, Instant::now()));
+
+        rel_event.flags = fse::ITEM_MODIFIED;
+        assert!(!hist.is_same(&rel_event, Instant::now()));
+    }
+}
